@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#0a0a14" />
+  <title>迷你地城 — pg-microdungeon</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div class="bg-ambiance" aria-hidden="true"></div>
+
+  <main>
+    <header class="hero">
+      <h1>迷你地城</h1>
+      <p class="subtitle">逐層往下的回合制探索，隨機生成、戰鬥節奏輕快。</p>
+    </header>
+
+    <section class="meter" aria-label="玩家狀態">
+      <div class="meter-row">
+        <span class="meter-label">樓層</span>
+        <span class="meter-val"><b id="floor-num">1</b> / 5</span>
+      </div>
+      <div class="meter-row meter-hp">
+        <span class="meter-label">HP</span>
+        <div class="bar-wrap" aria-label="生命值">
+          <div class="bar" id="hp-bar" style="width:100%"></div>
+          <span class="bar-text" id="hp">12/12</span>
+        </div>
+      </div>
+      <div class="meter-row meter-stats">
+        <span class="chip">攻 <b id="atk">3</b></span>
+        <span class="chip">金 <b id="gold">0</b></span>
+        <span class="chip">藥 <b id="potions">1</b></span>
+      </div>
+    </section>
+
+    <div class="stage-wrap">
+      <canvas id="stage" aria-label="迷宮"></canvas>
+
+      <div class="touch-pad" aria-label="方向控制">
+        <button id="t-up" class="t-btn" aria-label="向上">▲</button>
+        <button id="t-left" class="t-btn" aria-label="向左">◀</button>
+        <button id="t-down" class="t-btn" aria-label="向下">▼</button>
+        <button id="t-right" class="t-btn" aria-label="向右">▶</button>
+      </div>
+
+      <div id="combat" class="combat-modal" data-show="" aria-label="戰鬥面板">
+        <div class="combat-inner">
+          <div class="combat-head">
+            <span class="combat-name" id="combat-name">敵人</span>
+            <span class="combat-hp" id="combat-hp">0/0</span>
+          </div>
+          <div class="bar-wrap small">
+            <div class="bar" id="combat-bar" style="width:100%"></div>
+          </div>
+          <div class="combat-actions">
+            <button id="btn-attack" class="primary">攻擊 [1]</button>
+            <button id="btn-potion">喝藥水 [2]</button>
+            <button id="btn-flee">逃跑 [3]</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="overlay" class="overlay" data-show="" role="dialog" aria-modal="true">
+        <div class="overlay-inner">
+          <h2 id="overlay-title" data-tone="die">死亡</h2>
+          <p id="overlay-text"></p>
+          <button id="btn-restart" class="primary">重新開始</button>
+        </div>
+      </div>
+    </div>
+
+    <p id="status" class="status" role="status" aria-live="polite">載入中…</p>
+
+    <section class="controls">
+      <button id="btn-newgame" class="primary">新局</button>
+      <button id="btn-mute" aria-pressed="true">音效開</button>
+    </section>
+
+    <ul id="log" aria-label="事件紀錄"></ul>
+
+    <section class="rules">
+      <details open>
+        <summary>玩法</summary>
+        <ul>
+          <li>隨機生成每層地城：房間＋走廊、敵人、寶箱、樓梯。</li>
+          <li>移動：WASD／方向鍵，或下方 ◀▲▼▶ 觸控鍵；畫面 swipe 也可。</li>
+          <li>踩到敵人 → 戰鬥面板。攻擊／喝藥水／逃跑。</li>
+          <li>樓梯往下走到下一樓；第 5 樓有出口，抵達即過關。</li>
+          <li>死了可以重新開始（同一 seed 保留以便復盤）。</li>
+        </ul>
+      </details>
+    </section>
+
+    <section class="rules">
+      <details>
+        <summary>署名／授權</summary>
+        <p>美術：Kenney 1-bit Pack（CC0）。音樂：HydroGene — Perilous Dungeon（CC0）。音效：oga-rpg-sound-pack（CC0）。</p>
+      </details>
+    </section>
+  </main>
+</body>
+</html>
