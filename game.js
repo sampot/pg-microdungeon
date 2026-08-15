@@ -1,393 +1,480 @@
 /**
- * pg-microdungeon 核心：每局隨機生成地牢、回合制行動、戰鬥、寶箱、樓梯。
- * 純 ESM、無 DOM，方便單元測試。
+ * 迷你地城核心。
  *
- * 設計：
- * - 16×16 tile，每房 4–8 格寬，隨機 6–10 房；以「任意兩房之中心點走 L 形走廊」相連。
- * - 玩家／敵人輪流行動；回合輸入（WASD / 方向鍵）。
- * - 敵人先靠近玩家再攻。
- * - 寶箱：50% 給金幣／藥水／裝備。樓梯往下走新一關；最終第 N 樓為出口。
- * - 戰鬥：玩家先攻，若 hp > 0 → 敵回手；回合制螢幕跳出 modal。
- * - 視界：半徑 6 格的圓（曼哈頓距離），其餘以黑色遮罩表示「未探索」。
- * - 結束條件：玩家 hp=0 → 失敗；走到最終出口 → 勝利。
+ * 一局三層，每層都是短小、可重玩的迷宮。玩家找到符石後前往出口；
+ * 碰撞敵人即攻擊，不切換畫面，讓鍵盤、滑動與方向鍵都能一路玩到底。
  */
 
-export const TILE = 24;
-
+export const TILE = 32;
 export const FLOOR = 0;
 export const WALL = 1;
-export const DOOR = 2;
-export const STAIRS = 3;
-export const EXIT = 4;
-export const CHEST = 5;
-export const POTION = 6;
+export const STAIRS = 2;
+export const EXIT = 3;
+export const CHEST = 4;
+export const RELIC = 5;
 
-const TILE_PALETTE = {
-  [FLOOR]: { name: "floor" },
-  [WALL]: { name: "wall" },
-  [DOOR]: { name: "door" },
-  [STAIRS]: { name: "stairs" },
-  [EXIT]: { name: "exit" },
-  [CHEST]: { name: "chest" },
-  [POTION]: { name: "potion" },
+export const VIEW_W = 15 * TILE;
+export const VIEW_H = 11 * TILE;
+
+export function rng(seed) {
+  let value = seed | 0;
+  return function random() {
+    value = (value + 0x6d2b79f5) | 0;
+    let result = value;
+    result = Math.imul(result ^ (result >>> 15), result | 1);
+    result ^= result + Math.imul(result ^ (result >>> 7), result | 61);
+    return ((result ^ (result >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function randomInt(random, low, high) {
+  return low + Math.floor(random() * (high - low));
+}
+
+function shuffle(random, values) {
+  for (let index = values.length - 1; index > 0; index -= 1) {
+    const other = Math.floor(random() * (index + 1));
+    [values[index], values[other]] = [values[other], values[index]];
+  }
+  return values;
+}
+
+function createGrid(width, height, value) {
+  return Array.from({ length: height }, () => Array(width).fill(value));
+}
+
+function carveMaze(grid, random) {
+  const width = grid[0].length;
+  const height = grid.length;
+  const stack = [{ x: 1, y: 1 }];
+  grid[1][1] = FLOOR;
+
+  while (stack.length) {
+    const current = stack[stack.length - 1];
+    const choices = shuffle(random, [
+      { dx: 2, dy: 0 },
+      { dx: -2, dy: 0 },
+      { dx: 0, dy: 2 },
+      { dx: 0, dy: -2 },
+    ]).filter(({ dx, dy }) => {
+      const x = current.x + dx;
+      const y = current.y + dy;
+      return x > 0 && y > 0 && x < width - 1 && y < height - 1 && grid[y][x] === WALL;
+    });
+
+    if (!choices.length) {
+      stack.pop();
+      continue;
+    }
+
+    const { dx, dy } = choices[0];
+    grid[current.y + dy / 2][current.x + dx / 2] = FLOOR;
+    grid[current.y + dy][current.x + dx] = FLOOR;
+    stack.push({ x: current.x + dx, y: current.y + dy });
+  }
+
+  // 開幾條環路，避免每次走錯都必須原路折返。
+  const walls = [];
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      if (grid[y][x] !== WALL) continue;
+      const horizontal = grid[y][x - 1] === FLOOR && grid[y][x + 1] === FLOOR;
+      const vertical = grid[y - 1][x] === FLOOR && grid[y + 1][x] === FLOOR;
+      if (horizontal !== vertical) walls.push({ x, y });
+    }
+  }
+  shuffle(random, walls)
+    .slice(0, 8)
+    .forEach(({ x, y }) => {
+      grid[y][x] = FLOOR;
+    });
+}
+
+function distancesFrom(grid, start) {
+  const width = grid[0].length;
+  const height = grid.length;
+  const distances = new Map([[`${start.x},${start.y}`, 0]]);
+  const previous = new Map([[`${start.x},${start.y}`, null]]);
+  const queue = [start];
+
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index];
+    const distance = distances.get(`${current.x},${current.y}`);
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const x = current.x + dx;
+      const y = current.y + dy;
+      const key = `${x},${y}`;
+      if (x < 0 || y < 0 || x >= width || y >= height) continue;
+      if (grid[y][x] === WALL || distances.has(key)) continue;
+      distances.set(key, distance + 1);
+      previous.set(key, `${current.x},${current.y}`);
+      queue.push({ x, y });
+    }
+  }
+  return { distances, previous, tiles: queue };
+}
+
+function chooseObjectives(grid, random, start) {
+  const { distances, previous, tiles } = distancesFrom(grid, start);
+  const ranked = tiles
+    .filter((tile) => distances.get(`${tile.x},${tile.y}`) >= 6)
+    .sort((a, b) => distances.get(`${b.x},${b.y}`) - distances.get(`${a.x},${a.y}`));
+  const goal = ranked[0];
+  const shortestPath = [];
+  let pathKey = `${goal.x},${goal.y}`;
+  while (pathKey) {
+    const [x, y] = pathKey.split(",").map(Number);
+    shortestPath.push({ x, y });
+    pathKey = previous.get(pathKey);
+  }
+  shortestPath.reverse();
+  const relicProgress = 0.45 + random() * 0.2;
+  const relicIndex = Math.max(2, Math.min(shortestPath.length - 2, Math.floor(shortestPath.length * relicProgress)));
+  const relic = shortestPath[relicIndex];
+  return { goal, relic, floorTiles: tiles };
+}
+
+function enemyKind(random, level, index) {
+  const pools = [
+    ["slime", "bat", "rat"],
+    ["skeleton", "ghost", "slime", "bat"],
+    ["guard", "ghost", "skeleton", "demon"],
+  ];
+  const pool = pools[Math.min(level - 1, pools.length - 1)];
+  return index === 0 && level === 3 ? "demon" : pool[randomInt(random, 0, pool.length)];
+}
+
+const ENEMY_STATS = {
+  rat: { hp: 2, atk: 1 },
+  bat: { hp: 2, atk: 1 },
+  slime: { hp: 3, atk: 1 },
+  skeleton: { hp: 4, atk: 2 },
+  ghost: { hp: 3, atk: 2 },
+  guard: { hp: 5, atk: 2 },
+  demon: { hp: 8, atk: 3 },
 };
 
-export const TILE_KIND = TILE_PALETTE;
-
-/** Mulberry32 PRNG（給定 seed → 確定隨機；單元測試友善） */
-export function rng(seed) {
-  let t = seed | 0;
-  return function () {
-    t = (t + 0x6d2b79f5) | 0;
-    let r = t;
-    r = Math.imul(r ^ (r >>> 15), r | 1);
-    r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
+function tileKey({ x, y }) {
+  return `${x},${y}`;
 }
 
-/** 隨機整數 [lo, hi) */
-function ri(rand, lo, hi) {
-  return lo + Math.floor(rand() * (hi - lo));
-}
+export function generateDungeon(seed, level = 1, maxFloor = 3) {
+  const width = 21;
+  const height = 15;
+  const random = rng(seed + level * 7919);
+  const grid = createGrid(width, height, WALL);
+  carveMaze(grid, random);
 
-/** 房間：寬高範圍隨機；不相交即可 */
-function placeRooms(rand, w, h) {
-  const rooms = [];
-  const tries = 60;
-  for (let i = 0; i < tries; i++) {
-    const rw = ri(rand, 4, 8);
-    const rh = ri(rand, 3, 6);
-    const x = ri(rand, 1, w - rw - 1);
-    const y = ri(rand, 1, h - rh - 1);
-    const r = { x, y, w: rw, h: rh, cx: x + Math.floor(rw / 2), cy: y + Math.floor(rh / 2) };
-    // 不與現有房間太近（保留 1 格走廊空間）
-    let ok = true;
-    for (const o of rooms) {
-      if (r.x - 2 < o.x + o.w && r.x + r.w + 2 > o.x && r.y - 2 < o.y + o.h && r.y + r.h + 2 > o.y) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) rooms.push(r);
-    if (rooms.length >= 9) break;
-  }
-  return rooms;
-}
+  const playerStart = { x: 1, y: 1 };
+  const { goal, relic, floorTiles } = chooseObjectives(grid, random, playerStart);
+  grid[goal.y][goal.x] = level === maxFloor ? EXIT : STAIRS;
+  grid[relic.y][relic.x] = RELIC;
 
-function carveRoom(grid, r) {
-  for (let y = r.y; y < r.y + r.h; y++) {
-    for (let x = r.x; x < r.x + r.w; x++) {
-      grid[y][x] = FLOOR;
-    }
-  }
-}
+  const occupied = new Set([tileKey(playerStart), tileKey(goal), tileKey(relic)]);
+  const placementPool = shuffle(
+    random,
+    floorTiles.filter(({ x, y }) => {
+      const distance = Math.abs(x - playerStart.x) + Math.abs(y - playerStart.y);
+      return distance > 5 && grid[y][x] === FLOOR;
+    }),
+  );
 
-function carveCorridor(grid, ax, ay, bx, by) {
-  // L 形：先橫再豎；走隨機順序以增加多樣
-  const horizFirst = Math.random() < 0.5;
-  if (horizFirst) {
-    carveH(grid, ax, ay, bx);
-    carveV(grid, bx, ay, by);
-  } else {
-    carveV(grid, ax, ay, by);
-    carveH(grid, ax, by, bx);
-  }
-}
-
-function carveH(grid, ax, y, bx) {
-  const [lo, hi] = ax < bx ? [ax, bx] : [bx, ax];
-  for (let x = lo; x <= hi; x++) {
-    if (grid[y][x] !== FLOOR) grid[y][x] = FLOOR;
-  }
-}
-
-function carveV(grid, x, ay, by) {
-  const [lo, hi] = ay < by ? [ay, by] : [by, ay];
-  for (let y = lo; y <= hi; y++) {
-    if (grid[y][x] !== FLOOR) grid[y][x] = FLOOR;
-  }
-}
-
-/** 隨機生成地牢網格 + 樓梯位置 + 玩家起點。 */
-export function generateDungeon(seed, level = 1, maxFloor = 5) {
-  const rand = rng(seed + level * 7919);
-  const w = 32;
-  const h = 18;
-  const grid = [];
-  for (let y = 0; y < h; y++) {
-    const row = [];
-    for (let x = 0; x < w; x++) row.push(WALL);
-    grid.push(row);
-  }
-  const rooms = placeRooms(rand, w, h);
-  for (const r of rooms) carveRoom(grid, r);
-  // 走廊：每房連到下一房（順序打亂）
-  const order = rooms.slice();
-  for (let i = order.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [order[i], order[j]] = [order[j], order[i]];
-  }
-  for (let i = 1; i < order.length; i++) {
-    const a = order[i - 1];
-    const b = order[i];
-    carveCorridor(grid, a.cx, a.cy, b.cx, b.cy);
-  }
-  // 樓梯／出口
-  const lastRoom = rooms[rooms.length - 1];
-  const stairsRoom = rooms[rooms.length - 1 - Math.floor(rand() * Math.min(2, rooms.length - 1))];
-  const stairs = { x: stairsRoom.cx, y: stairsRoom.cy };
-  grid[stairs.y][stairs.x] = STAIRS;
-  const exit = { x: lastRoom.cx, y: lastRoom.cy };
-  if (level === maxFloor) grid[exit.y][exit.x] = EXIT;
-  else grid[exit.y][exit.x] = STAIRS;
-  // 敵人：每房一隻（除了第一房）
-  const enemies = [];
-  for (let i = 1; i < rooms.length; i++) {
-    const r = rooms[i];
-    if (r.cx === stairs.x && r.cy === stairs.y) continue;
-    const kind = pickEnemyKind(rand, level);
-    enemies.push({
-      kind,
-      x: r.cx,
-      y: r.cy,
-      hp: enemyHp(kind, level),
-      maxHp: enemyHp(kind, level),
-      atk: enemyAtk(kind, level),
-      alive: true,
-      turnDelay: 1, // 玩家先動；之後與玩家輪流
+  const chests = [];
+  for (let index = 0; index < 2; index += 1) {
+    const tile = placementPool.find((candidate) => !occupied.has(tileKey(candidate)));
+    if (!tile) break;
+    occupied.add(tileKey(tile));
+    grid[tile.y][tile.x] = CHEST;
+    chests.push({
+      ...tile,
+      opened: false,
+      kind: index === 0 ? "potion" : "gold",
+      amount: index === 0 ? 1 : 5 + level * 3,
     });
   }
-  // 寶箱：一個隨機房間放一個寶箱（金幣或藥水）
-  let chestRoom = rooms[Math.floor(rand() * rooms.length)];
-  let tries = 0;
-  while ((chestRoom.cx === stairs.x && chestRoom.cy === stairs.y) && tries < 8) {
-    chestRoom = rooms[Math.floor(rand() * rooms.length)];
-    tries++;
+
+  const enemies = [];
+  const enemyCount = 3 + level;
+  for (let index = 0; index < enemyCount; index += 1) {
+    const tile = placementPool.find((candidate) => !occupied.has(tileKey(candidate)));
+    if (!tile) break;
+    occupied.add(tileKey(tile));
+    const kind = enemyKind(random, level, index);
+    const base = ENEMY_STATS[kind];
+    const hp = base.hp + Math.max(0, level - 1);
+    enemies.push({ kind, ...tile, hp, maxHp: hp, atk: base.atk, alive: true });
   }
-  const chest = {
-    x: chestRoom.cx,
-    y: chestRoom.cy,
-    opened: false,
-    kind: rand() < 0.5 ? "gold" : "potion",
-    amount: ri(rand, 8 + level * 2, 18 + level * 4),
-  };
-  grid[chest.y][chest.x] = CHEST;
-  return {
+
+  const dungeon = {
     seed,
     level,
     maxFloor,
-    w,
-    h,
+    w: width,
+    h: height,
     grid,
-    rooms,
-    stairs,
-    exit,
+    goal,
+    relic,
+    chests,
     enemies,
-    chest,
-    player: { x: rooms[0].cx, y: rooms[0].cy, hp: 12, maxHp: 12, atk: 3, gold: 0, potions: 1 },
-    explored: new Uint8Array(w * h),
-    visible: new Uint8Array(w * h),
+    player: {
+      ...playerStart,
+      hp: 14,
+      maxHp: 14,
+      atk: 2,
+      gold: 0,
+      potions: 2,
+      kills: 0,
+      hasRelic: false,
+    },
+    turns: 0,
+    explored: new Uint8Array(width * height),
+    visible: new Uint8Array(width * height),
     log: [],
-    state: "playing", // playing | combat | won | dead
+    state: "playing",
   };
+  recomputeVisibility(dungeon);
+  return dungeon;
 }
 
-function pickEnemyKind(rand, level) {
-  const pool = ["rat", "skeleton", "bat"];
-  if (level >= 2) pool.push("slime", "zombie");
-  if (level >= 3) pool.push("ghost", "skeleton_knight");
-  if (level >= 4) pool.push("demon");
-  return pool[Math.floor(rand() * pool.length)];
+function addLog(dungeon, kind, text) {
+  dungeon.log.unshift({ kind, text });
+  dungeon.log.length = Math.min(dungeon.log.length, 8);
 }
 
-function enemyHp(kind, level) {
-  const base = { rat: 4, skeleton: 6, bat: 3, slime: 5, zombie: 7, ghost: 6, skeleton_knight: 9, demon: 11 }[kind] || 5;
-  return base + Math.floor(level * 1.4);
-}
-function enemyAtk(kind, level) {
-  const base = { rat: 1, skeleton: 2, bat: 1, slime: 1, zombie: 2, ghost: 2, skeleton_knight: 3, demon: 4 }[kind] || 1;
-  return base + Math.floor(level * 0.5);
-}
-
-/** 計算迷霧：曼哈頓距離 ≤ radius 為可見；曾經可見為 explored。 */
-export function recomputeVisibility(d) {
-  const r = 6;
-  for (let y = 0; y < d.h; y++) {
-    for (let x = 0; x < d.w; x++) {
-      const idx = y * d.w + x;
-      if (d.grid[y][x] === WALL || d.grid[y][x] === DOOR) {
-        // 牆只貼鄰才算可見
-        if (Math.abs(x - d.player.x) + Math.abs(y - d.player.y) <= r + 1) {
-          d.visible[idx] = 1;
-        } else {
-          d.visible[idx] = 0;
-        }
-      } else {
-        d.visible[idx] = Math.abs(x - d.player.x) + Math.abs(y - d.player.y) <= r ? 1 : 0;
-      }
-      if (d.visible[idx]) d.explored[idx] = 1;
+export function recomputeVisibility(dungeon) {
+  const radius = 6;
+  dungeon.visible.fill(0);
+  for (let y = 0; y < dungeon.h; y += 1) {
+    for (let x = 0; x < dungeon.w; x += 1) {
+      const distance = Math.abs(x - dungeon.player.x) + Math.abs(y - dungeon.player.y);
+      const visible = distance <= radius + (dungeon.grid[y][x] === WALL ? 1 : 0);
+      const index = y * dungeon.w + x;
+      dungeon.visible[index] = visible ? 1 : 0;
+      if (visible) dungeon.explored[index] = 1;
     }
   }
 }
 
-/** 嘗試玩家往 (dx, dy) 走一步。回傳 { moved, encounter, blocked, combat? } */
-export function tryPlayerMove(d, dx, dy) {
-  if (d.state !== "playing") return { blocked: true };
-  const nx = d.player.x + dx;
-  const ny = d.player.y + dy;
-  if (nx < 0 || ny < 0 || nx >= d.w || ny >= d.h) return { blocked: true };
-  const t = d.grid[ny][nx];
-  if (t === WALL || t === DOOR) return { blocked: true };
-  // 撞敵 → 開打
-  const e = d.enemies.find((e) => e.alive && e.x === nx && e.y === ny);
-  if (e) {
-    return startCombat(d, e);
-  }
-  d.player.x = nx;
-  d.player.y = ny;
-  recomputeVisibility(d);
-  // 踩樓梯/出口/寶箱
-  if (t === STAIRS && d.level < d.maxFloor) {
-    return { moved: true, descend: true };
-  }
-  if (t === EXIT) {
-    d.state = "won";
-    return { moved: true, won: true };
-  }
-  if (t === CHEST && !d.chest.opened) {
-    openChest(d);
-  }
-  // 敵人回合（若仍存活）
-  enemyTurn(d);
-  return { moved: true };
+function livingEnemyAt(dungeon, x, y) {
+  return dungeon.enemies.find((enemy) => enemy.alive && enemy.x === x && enemy.y === y);
 }
 
-function openChest(d) {
-  d.chest.opened = true;
-  d.grid[d.chest.y][d.chest.x] = FLOOR;
-  if (d.chest.kind === "gold") {
-    d.player.gold += d.chest.amount;
-    d.log.unshift({ kind: "loot", text: `獲得 ${d.chest.amount} 金幣` });
+function defeatEnemy(dungeon, enemy) {
+  enemy.alive = false;
+  dungeon.player.kills += 1;
+  dungeon.player.gold += 2 + dungeon.level;
+  addLog(dungeon, "kill", `${enemyLabel(enemy.kind)}倒下了！`);
+
+  if (dungeon.player.kills % 3 === 0) {
+    dungeon.player.atk += 1;
+    dungeon.player.maxHp += 1;
+    dungeon.player.hp = Math.min(dungeon.player.maxHp, dungeon.player.hp + 3);
+    addLog(dungeon, "level", "勇氣提升：攻擊與生命上升！");
+  }
+}
+
+function attackEnemy(dungeon, enemy) {
+  enemy.hp -= dungeon.player.atk;
+  dungeon.turns += 1;
+  if (enemy.hp <= 0) {
+    defeatEnemy(dungeon, enemy);
+    dungeon.player.x = enemy.x;
+    dungeon.player.y = enemy.y;
+    const enemyResult = enemyTurn(dungeon);
+    recomputeVisibility(dungeon);
+    return {
+      moved: true,
+      hit: true,
+      killed: true,
+      hurt: enemyResult.hurt,
+      death: enemyResult.death,
+    };
+  }
+
+  dungeon.player.hp -= enemy.atk;
+  addLog(dungeon, "strike", `${enemyLabel(enemy.kind)}反擊，生命 -${enemy.atk}`);
+  if (dungeon.player.hp <= 0) {
+    dungeon.player.hp = 0;
+    dungeon.state = "dead";
+    return { hit: true, death: true };
+  }
+  return { hit: true };
+}
+
+function openChest(dungeon, x, y) {
+  const chest = dungeon.chests.find((item) => !item.opened && item.x === x && item.y === y);
+  if (!chest) return;
+  chest.opened = true;
+  dungeon.grid[y][x] = FLOOR;
+  if (chest.kind === "potion") {
+    dungeon.player.potions += chest.amount;
+    addLog(dungeon, "loot", "寶箱裡有一瓶紅藥水！");
   } else {
-    d.player.potions += 1;
-    d.log.unshift({ kind: "loot", text: "撿到一瓶藥水" });
+    dungeon.player.gold += chest.amount;
+    addLog(dungeon, "loot", `找到 ${chest.amount} 枚古幣！`);
   }
 }
 
-/** 敵人回合：朝玩家走近一步（沿最少軸），相鄰則不動。 */
-function enemyTurn(d) {
-  for (const e of d.enemies) {
-    if (!e.alive) continue;
-    if (Math.abs(e.x - d.player.x) + Math.abs(e.y - d.player.y) === 1) {
-      // 相鄰，敵人暫不攻擊；攻擊發生在 combat modal（玩家撞過去）
-      continue;
-    }
-    // 朝玩家移 1 格
-    const dx = Math.sign(d.player.x - e.x);
-    const dy = Math.sign(d.player.y - e.y);
-    // 嘗試先橫後豎；不通就反之
-    if (dx !== 0 && canStep(d, e.x + dx, e.y, e)) {
-      e.x += dx;
-    } else if (dy !== 0 && canStep(d, e.x, e.y + dy, e)) {
-      e.y += dy;
-    } else if (dy !== 0 && canStep(d, e.x + dx, e.y, e)) {
-      // 也允許改走另一軸
-      e.x += dx;
-    }
+export function tryPlayerMove(dungeon, dx, dy) {
+  if (dungeon.state !== "playing") return { blocked: true };
+  const x = dungeon.player.x + dx;
+  const y = dungeon.player.y + dy;
+  if (x < 0 || y < 0 || x >= dungeon.w || y >= dungeon.h) return { blocked: true };
+  if (dungeon.grid[y][x] === WALL) return { blocked: true };
+
+  const enemy = livingEnemyAt(dungeon, x, y);
+  if (enemy) return attackEnemy(dungeon, enemy);
+
+  const tile = dungeon.grid[y][x];
+  if ((tile === STAIRS || tile === EXIT) && !dungeon.player.hasRelic) {
+    addLog(dungeon, "locked", "出口沒有反應——先找到發光符石。");
+    return { locked: true };
   }
-  recomputeVisibility(d);
+
+  dungeon.player.x = x;
+  dungeon.player.y = y;
+  dungeon.turns += 1;
+
+  const result = { moved: true };
+  if (tile === CHEST) {
+    openChest(dungeon, x, y);
+    result.chest = true;
+  } else if (tile === RELIC) {
+    dungeon.player.hasRelic = true;
+    dungeon.grid[y][x] = FLOOR;
+    addLog(dungeon, "relic", "符石入手！出口的火焰亮起了。");
+    result.relic = true;
+  } else if (tile === STAIRS) {
+    result.descend = true;
+    return result;
+  } else if (tile === EXIT) {
+    dungeon.state = "won";
+    result.won = true;
+    return result;
+  }
+
+  const enemyResult = enemyTurn(dungeon);
+  recomputeVisibility(dungeon);
+  if (enemyResult.death) return { ...result, death: true };
+  if (enemyResult.hurt) result.hurt = enemyResult.hurt;
+  return result;
 }
 
-function canStep(d, x, y, me) {
-  if (x < 0 || y < 0 || x >= d.w || y >= d.h) return false;
-  const t = d.grid[y][x];
-  if (t === WALL || t === DOOR || t === CHEST || t === STAIRS || t === EXIT) return false;
-  if (d.enemies.some((o) => o !== me && o.alive && o.x === x && o.y === y)) return false;
-  if (x === d.player.x && y === d.player.y) return false;
+function passableForEnemy(dungeon, x, y, movingEnemy) {
+  if (x < 0 || y < 0 || x >= dungeon.w || y >= dungeon.h) return false;
+  if (dungeon.grid[y][x] === WALL) return false;
+  if (livingEnemyAt(dungeon, x, y) && livingEnemyAt(dungeon, x, y) !== movingEnemy) return false;
   return true;
 }
 
-/** 玩家撞到敵人：開戰。回傳 { combat: { enemy, log } } */
-function startCombat(d, e) {
-  d.state = "combat";
-  return { combat: { enemy: e } };
-}
+function nextEnemyStep(dungeon, enemy) {
+  const startKey = `${enemy.x},${enemy.y}`;
+  const queue = [{ x: enemy.x, y: enemy.y }];
+  const previous = new Map([[startKey, null]]);
+  let targetKey = null;
 
-/** 玩家在戰鬥選項：attack / flee / potion。回傳 { done, log, flee?, death?, victory? } */
-export function combatAction(d, action) {
-  if (d.state !== "combat") return { done: true };
-  // 找出最近敵
-  const e = d.enemies.find((e) => e.alive && Math.abs(e.x - d.player.x) + Math.abs(e.y - d.player.y) === 1);
-  if (!e) {
-    d.state = "playing";
-    return { done: true, log: [{ kind: "system", text: "敵人不見了" }] };
-  }
-  if (action === "flee") {
-    // 50% 成功：玩家退一步
-    if (Math.random() < 0.5) {
-      d.state = "playing";
-      return { done: true, log: [{ kind: "system", text: "成功逃脫" }] };
+  for (let index = 0; index < queue.length && index < 90; index += 1) {
+    const current = queue[index];
+    if (current.x === dungeon.player.x && current.y === dungeon.player.y) {
+      targetKey = `${current.x},${current.y}`;
+      break;
     }
-    // 失敗 → 敵人先打
-    return enemyStrike(d, e);
-  }
-  if (action === "potion") {
-    if (d.player.potions <= 0) {
-      return { done: false, log: [{ kind: "system", text: "藥水用完" }] };
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const next = { x: current.x + dx, y: current.y + dy };
+      const key = `${next.x},${next.y}`;
+      if (previous.has(key) || !passableForEnemy(dungeon, next.x, next.y, enemy)) continue;
+      previous.set(key, `${current.x},${current.y}`);
+      queue.push(next);
     }
-    d.player.potions -= 1;
-    d.player.hp = Math.min(d.player.maxHp, d.player.hp + 5);
-    return enemyStrike(d, e);
   }
-  // attack
-  const dmg = Math.max(1, d.player.atk + Math.floor(Math.random() * 2));
-  e.hp -= dmg;
-  if (e.hp <= 0) {
-    e.alive = false;
-    d.player.gold += 3 + d.level;
-    d.state = "playing";
-    return { done: true, victory: true, log: [{ kind: "kill", text: `${labelKind(e.kind)} 被打倒 (+${3 + d.level} 金幣)` }] };
+
+  if (!targetKey) return null;
+  let stepKey = targetKey;
+  while (previous.get(stepKey) !== startKey) {
+    stepKey = previous.get(stepKey);
+    if (!stepKey) return null;
   }
-  return enemyStrike(d, e);
+  const [x, y] = stepKey.split(",").map(Number);
+  return { x, y };
 }
 
-function enemyStrike(d, e) {
-  const dmg = Math.max(1, e.atk + Math.floor(Math.random() * 2));
-  d.player.hp -= dmg;
-  if (d.player.hp <= 0) {
-    d.state = "dead";
-    d.player.hp = 0;
-    return { done: true, death: true, log: [{ kind: "death", text: `被 ${labelKind(e.kind)} 打倒 (-${dmg} HP)` }] };
+function enemyTurn(dungeon) {
+  let hurt = 0;
+  let attacked = false;
+  for (const enemy of dungeon.enemies) {
+    if (!enemy.alive) continue;
+    const distance = Math.abs(enemy.x - dungeon.player.x) + Math.abs(enemy.y - dungeon.player.y);
+    if (distance === 1) {
+      if (!attacked) {
+        dungeon.player.hp -= enemy.atk;
+        hurt += enemy.atk;
+        attacked = true;
+      }
+      continue;
+    }
+    if (distance > 5) continue;
+    const step = nextEnemyStep(dungeon, enemy);
+    if (step && !(step.x === dungeon.player.x && step.y === dungeon.player.y)) {
+      enemy.x = step.x;
+      enemy.y = step.y;
+    }
   }
-  return { done: false, log: [{ kind: "strike", text: `${labelKind(e.kind)} 還擊 -${dmg} HP` }] };
+
+  if (hurt) addLog(dungeon, "strike", `怪物圍攻，生命 -${hurt}`);
+  if (dungeon.player.hp <= 0) {
+    dungeon.player.hp = 0;
+    dungeon.state = "dead";
+    return { hurt, death: true };
+  }
+  return { hurt };
 }
 
-function labelKind(k) {
-  return {
-    rat: "巨鼠",
-    skeleton: "骷髏兵",
-    bat: "蝙蝠",
-    slime: "史萊姆",
-    zombie: "殭屍",
-    ghost: "鬼魂",
-    skeleton_knight: "骷髏騎士",
-    demon: "惡魔",
-  }[k] || k;
+export function drinkPotion(dungeon) {
+  if (dungeon.state !== "playing") return { used: false };
+  if (dungeon.player.potions <= 0) {
+    addLog(dungeon, "system", "紅藥水用完了。");
+    return { used: false };
+  }
+  if (dungeon.player.hp >= dungeon.player.maxHp) {
+    addLog(dungeon, "system", "生命已經全滿。");
+    return { used: false };
+  }
+
+  dungeon.player.potions -= 1;
+  dungeon.player.hp = Math.min(dungeon.player.maxHp, dungeon.player.hp + 6);
+  dungeon.turns += 1;
+  addLog(dungeon, "heal", "喝下紅藥水，恢復生命。");
+  const result = enemyTurn(dungeon);
+  recomputeVisibility(dungeon);
+  return { used: true, death: result.death };
 }
 
-/** 下一樓。生成下一個 dungeon 並保留玩家屬性。 */
-export function descendLevel(d) {
-  const next = generateDungeon(d.seed, d.level + 1, d.maxFloor);
-  next.player.hp = d.player.hp;
-  next.player.maxHp = d.player.maxHp;
-  next.player.atk = d.player.atk;
-  next.player.gold = d.player.gold;
-  next.player.potions = d.player.potions;
+export function descendLevel(dungeon) {
+  const next = generateDungeon(dungeon.seed, dungeon.level + 1, dungeon.maxFloor);
+  next.player = {
+    ...next.player,
+    hp: Math.min(dungeon.player.maxHp, dungeon.player.hp + 2),
+    maxHp: dungeon.player.maxHp,
+    atk: dungeon.player.atk,
+    gold: dungeon.player.gold,
+    potions: dungeon.player.potions,
+    kills: dungeon.player.kills,
+    hasRelic: false,
+  };
+  next.turns = dungeon.turns;
+  addLog(next, "level", `深入第 ${next.level} 層，喘口氣恢復 2 點生命。`);
   recomputeVisibility(next);
-  next.log.unshift({ kind: "system", text: `走下樓梯，抵達第 ${next.level} 樓` });
   return next;
 }
 
-export const VIEW_W = 18 * TILE;
-export const VIEW_H = 12 * TILE;
+export function enemyLabel(kind) {
+  return {
+    rat: "洞窟鼠",
+    bat: "暗影蝠",
+    slime: "苔泥怪",
+    skeleton: "骷髏兵",
+    ghost: "迷途幽靈",
+    guard: "地城守衛",
+    demon: "深淵魔像",
+  }[kind] ?? kind;
+}

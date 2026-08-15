@@ -1,459 +1,544 @@
-/**
- * pg-microdungeon 主程式：Canvas 渲染、輸入、回合流程、HUD、戰鬥 modal。
- *
- * 圖塊來源：Kenney 1-bit Pack colored_packed tilesheet（46×20，16×16 + 1px gap）
- * 圖塊索引（row, col）見 TILES 常數。
- *
- * 行動裝置：◀▲▼▶ 觸控鍵 + 點畫面 swipe
- * 鍵盤：WASD / 方向鍵 移動；Enter 確認；Esc 取消
- *
- * 戰鬥模態：顯示敵人資訊、HP 條，3 個動作按鈕
- */
-
+import { DungeonAudio } from "./audio.js";
 import {
+  CHEST,
+  EXIT,
+  FLOOR,
+  RELIC,
+  STAIRS,
   TILE,
-  VIEW_W,
   VIEW_H,
+  VIEW_W,
+  WALL,
+  descendLevel,
+  drinkPotion,
+  enemyLabel,
   generateDungeon,
   tryPlayerMove,
-  combatAction,
-  descendLevel,
-  recomputeVisibility,
-  FLOOR,
-  WALL,
-  DOOR,
-  STAIRS,
-  EXIT,
-  CHEST,
 } from "./game.js";
-import { DungeonAudio } from "./audio.js";
-
-const audio = new DungeonAudio();
 
 const ATLAS_PATH = "assets/tiles/atlas.png";
-const TILE_W = 16;       // atlas tile width
-const TILE_H = 16;       // atlas tile height
-const TILE_GAP = 1;      // 1px gap
-const STRIDE = TILE_W + TILE_GAP; // 17
+const SOURCE_TILE = 16;
+const VIEW_COLS = VIEW_W / TILE;
+const VIEW_ROWS = VIEW_H / TILE;
+const FLOOR_COLOR = "#472d3c";
 
-/**
- * (row, col) tile indices in the atlas. Determined by visual inspection.
- * (r, c) → source rect (col * STRIDE, row * STRIDE, TILE_W, TILE_H)
- */
-const TILES = {
-  floor:      { r: 1, c: 5  }, // cobblestone
-  wall:       { r: 2, c: 0  }, // brown brick
-  door:       { r: 5, c: 14 }, // red door
-  stairs:     { r: 6, c: 13 }, // ladder down
-  exit:       { r: 6, c: 13 }, // reuse stairs for exit (or use a portal)
-  chest:      { r: 3, c: 5  }, // brown chest
-  player:     { r: 10, c: 17 }, // blue knight idle
-  playerWalk: { r: 9, c: 17 }, // walking pose
-  enemy: {
-    rat:               { r: 10, c: 8  },
-    skeleton:          { r: 9, c: 9  },
-    bat:               { r: 10, c: 7 },
-    slime:             { r: 11, c: 8 },
-    zombie:            { r: 12, c: 10 }, // skeleton with shield (alt)
-    ghost:             { r: 12, c: 9 }, // slime purple
-    skeleton_knight:   { r: 9, c: 10 },
-    demon:             { r: 13, c: 9 }, // orange slime (reuse for demon)
+// atlas.png 是 Kenney colored_packed：49×22、每格 16×16、格間距 0。
+const SPRITES = {
+  player: { r: 7, c: 24 },
+  enemies: {
+    rat: { r: 7, c: 28 },
+    bat: { r: 8, c: 26 },
+    slime: { r: 8, c: 23 },
+    skeleton: { r: 8, c: 27 },
+    ghost: { r: 8, c: 25 },
+    guard: { r: 8, c: 30 },
+    demon: { r: 8, c: 22 },
   },
 };
 
-const KIND_LABEL = {
-  rat: "巨鼠",
-  skeleton: "骷髏兵",
-  bat: "蝙蝠",
-  slime: "史萊姆",
-  zombie: "殭屍",
-  ghost: "鬼魂",
-  skeleton_knight: "骷髏騎士",
-  demon: "惡魔",
-};
-
-const el = {
+const elements = {
   canvas: document.getElementById("stage"),
-  c: document.getElementById("stage").getContext("2d"),
-  status: document.getElementById("status"),
-  floorN: document.getElementById("floor-num"),
-  hpText: document.getElementById("hp"),
+  floor: document.getElementById("floor-num"),
+  hp: document.getElementById("hp"),
   hpBar: document.getElementById("hp-bar"),
-  gold: document.getElementById("gold"),
-  potions: document.getElementById("potions"),
+  healthTrack: document.querySelector(".health-track"),
   atk: document.getElementById("atk"),
+  gold: document.getElementById("gold"),
+  kills: document.getElementById("kills"),
+  potions: document.getElementById("potions"),
+  quest: document.querySelector(".quest"),
+  questIcon: document.getElementById("quest-icon"),
+  questTitle: document.getElementById("quest-title"),
+  status: document.getElementById("status"),
   log: document.getElementById("log"),
-  btnMute: document.getElementById("btn-mute"),
-  btnNewGame: document.getElementById("btn-newgame"),
-  btnRestart: document.getElementById("btn-restart"),
-  btnAttack: document.getElementById("btn-attack"),
-  btnPotion: document.getElementById("btn-potion"),
-  btnFlee: document.getElementById("btn-flee"),
-  combat: document.getElementById("combat"),
-  combatName: document.getElementById("combat-name"),
-  combatHp: document.getElementById("combat-hp"),
-  combatBar: document.getElementById("combat-bar"),
   overlay: document.getElementById("overlay"),
+  overlayMark: document.getElementById("overlay-mark"),
   overlayTitle: document.getElementById("overlay-title"),
   overlayText: document.getElementById("overlay-text"),
-  touchLeft: document.getElementById("t-left"),
-  touchRight: document.getElementById("t-right"),
-  touchUp: document.getElementById("t-up"),
-  touchDown: document.getElementById("t-down"),
+  restart: document.getElementById("btn-restart"),
+  newGame: document.getElementById("btn-newgame"),
+  potion: document.getElementById("btn-potion"),
+  mute: document.getElementById("btn-mute"),
+  directions: {
+    up: document.getElementById("t-up"),
+    left: document.getElementById("t-left"),
+    down: document.getElementById("t-down"),
+    right: document.getElementById("t-right"),
+  },
 };
 
-let state = {
-  d: null,
-  seed: null,
-  anim: 0,
-  drawScale: 1,
-};
-
-/* 載入圖 */
+const context = elements.canvas.getContext("2d");
 const atlas = new Image();
 atlas.src = ATLAS_PATH;
+const audio = new DungeonAudio();
 
-function tileRect(t) {
-  return {
-    sx: t.c * STRIDE,
-    sy: t.r * STRIDE,
-    sw: TILE_W,
-    sh: TILE_H,
-  };
-}
+const state = {
+  dungeon: null,
+  seed: 0,
+  frame: 0,
+  pixelRatio: 1,
+  audioStarted: false,
+  overlayShown: false,
+  impact: null,
+};
 
-function tileAt(row, col) {
-  return { sx: col * STRIDE, sy: row * STRIDE, sw: TILE_W, sh: TILE_H };
-}
-
-/* 等比縮放 canvas 內部繪圖 */
-function fitCanvas() {
-  const rect = el.canvas.getBoundingClientRect();
-  const viewRatio = VIEW_W / VIEW_H;
-  let h = rect.height;
-  let w = rect.height * viewRatio;
-  if (w > rect.width) {
-    w = rect.width;
-    h = rect.width / viewRatio;
-  }
-  return { w, h, ox: (rect.width - w) / 2, oy: (rect.height - h) / 2 };
+function clamp(value, low, high) {
+  return Math.max(low, Math.min(high, value));
 }
 
 function resizeCanvas() {
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  const w = el.canvas.clientWidth;
-  const h = el.canvas.clientHeight;
-  el.canvas.width = Math.round(w * dpr);
-  el.canvas.height = Math.round(h * dpr);
-  el.c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  state.pixelRatio = ratio;
+  const width = elements.canvas.clientWidth;
+  const height = elements.canvas.clientHeight;
+  elements.canvas.width = Math.round(width * ratio);
+  elements.canvas.height = Math.round(height * ratio);
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.imageSmoothingEnabled = false;
 }
 
-/* 渲染 */
-function draw() {
-  if (!state.d) return;
-  const f = fitCanvas();
-  const ctx = el.c;
-  state.drawScale = f.w / VIEW_W;
-  ctx.imageSmoothingEnabled = false;
-  ctx.fillStyle = "#0a0a14";
-  ctx.fillRect(0, 0, el.canvas.clientWidth, el.canvas.clientHeight);
-  ctx.save();
-  ctx.translate(f.ox, f.oy);
-  ctx.scale(state.drawScale, state.drawScale);
+function cameraFor(dungeon) {
+  return {
+    x: clamp(dungeon.player.x - Math.floor(VIEW_COLS / 2), 0, dungeon.w - VIEW_COLS),
+    y: clamp(dungeon.player.y - Math.floor(VIEW_ROWS / 2), 0, dungeon.h - VIEW_ROWS),
+  };
+}
 
-  const d = state.d;
-  const cx = d.player.x;
-  const cy = d.player.y;
-  const col0 = Math.max(0, cx - 9);
-  const col1 = Math.min(d.w - 1, cx + 9);
-  const row0 = Math.max(0, cy - 6);
-  const row1 = Math.min(d.h - 1, cy + 6);
+function fitStage() {
+  const width = elements.canvas.clientWidth;
+  const height = elements.canvas.clientHeight;
+  const scale = Math.min(width / VIEW_W, height / VIEW_H);
+  return {
+    scale,
+    x: (width - VIEW_W * scale) / 2,
+    y: (height - VIEW_H * scale) / 2,
+  };
+}
 
-  // 視界外的格畫黑色霧
-  for (let y = row0; y <= row1; y++) {
-    for (let x = col0; x <= col1; x++) {
-      const idx = y * d.w + x;
-      const vis = d.visible[idx];
-      const exp = d.explored[idx];
-      const px = (x - col0) * TILE;
-      const py = (y - row0) * TILE;
-      if (!exp) {
-        ctx.fillStyle = "#000";
-        ctx.fillRect(px, py, TILE, TILE);
+function drawSprite(sprite, x, y, size = TILE) {
+  if (!atlas.complete || !atlas.naturalWidth) return false;
+  context.drawImage(
+    atlas,
+    sprite.c * SOURCE_TILE,
+    sprite.r * SOURCE_TILE,
+    SOURCE_TILE,
+    SOURCE_TILE,
+    x,
+    y,
+    size,
+    size,
+  );
+  return true;
+}
+
+function drawFloor(x, y, mapX, mapY) {
+  context.fillStyle = FLOOR_COLOR;
+  context.fillRect(x, y, TILE, TILE);
+  const pattern = (mapX * 13 + mapY * 7) % 5;
+  context.fillStyle = pattern < 2 ? "#553447" : "#3d2735";
+  context.fillRect(x + 4 + pattern * 3, y + 5 + (pattern % 3) * 7, 3, 3);
+  context.fillRect(x + 22 - pattern * 2, y + 23 - (pattern % 2) * 8, 2, 2);
+}
+
+function drawWall(x, y, mapX, mapY) {
+  context.fillStyle = "#211626";
+  context.fillRect(x, y, TILE, TILE);
+  context.fillStyle = "#33233a";
+  context.fillRect(x + 1, y + 1, TILE - 2, TILE - 3);
+  context.strokeStyle = "#563750";
+  context.lineWidth = 2;
+  context.strokeRect(x + 2, y + 3, 13, 10);
+  context.strokeRect(x + 17, y + 3, 13, 10);
+  context.strokeRect(x + 8, y + 15, 16, 10);
+  if ((mapX + mapY) % 4 === 0) {
+    context.fillStyle = "#6a3f58";
+    context.fillRect(x + 4, y + 27, 5, 2);
+  }
+}
+
+function drawChest(x, y) {
+  context.fillStyle = "#2d1a24";
+  context.fillRect(x + 5, y + 9, 22, 18);
+  context.fillStyle = "#bd694b";
+  context.fillRect(x + 6, y + 8, 20, 8);
+  context.fillStyle = "#8b463e";
+  context.fillRect(x + 6, y + 17, 20, 9);
+  context.fillStyle = "#ffd166";
+  context.fillRect(x + 14, y + 14, 4, 7);
+  context.fillStyle = "#582e38";
+  context.fillRect(x + 5, y + 16, 22, 2);
+}
+
+function drawRelic(x, y) {
+  const pulse = state.frame % 50 < 25 ? 1 : 0;
+  context.fillStyle = pulse ? "rgb(103 197 232 / 22%)" : "rgb(103 197 232 / 12%)";
+  context.fillRect(x + 3, y + 3, 26, 26);
+  context.fillStyle = "#b9efff";
+  context.beginPath();
+  context.moveTo(x + 16, y + 4);
+  context.lineTo(x + 25, y + 15);
+  context.lineTo(x + 16, y + 28);
+  context.lineTo(x + 7, y + 15);
+  context.closePath();
+  context.fill();
+  context.fillStyle = "#47a9d2";
+  context.fillRect(x + 14, y + 9, 4, 14);
+}
+
+function drawGoal(x, y, final, unlocked) {
+  context.fillStyle = unlocked ? "#654c2e" : "#30283b";
+  context.fillRect(x + 5, y + 3, 22, 27);
+  context.fillStyle = unlocked ? "#ffd166" : "#796a84";
+  if (final) {
+    context.fillRect(x + 8, y + 7, 16, 3);
+    context.fillRect(x + 10, y + 12, 12, 14);
+    context.fillStyle = "#1d172b";
+    context.fillRect(x + 14, y + 17, 4, 9);
+  } else {
+    for (let rung = 0; rung < 4; rung += 1) {
+      context.fillRect(x + 9, y + 7 + rung * 6, 14, 2);
+    }
+    context.fillRect(x + 8, y + 5, 3, 23);
+    context.fillRect(x + 21, y + 5, 3, 23);
+  }
+}
+
+function drawFallbackEnemy(x, y, kind) {
+  context.fillStyle = kind === "demon" ? "#f4b41b" : "#cfc6b8";
+  context.fillRect(x + 7, y + 8, 18, 17);
+  context.fillStyle = "#472d3c";
+  context.fillRect(x + 11, y + 13, 3, 3);
+  context.fillRect(x + 19, y + 13, 3, 3);
+}
+
+function drawDungeon() {
+  if (!state.dungeon) return;
+  const dungeon = state.dungeon;
+  const fit = fitStage();
+  const camera = cameraFor(dungeon);
+
+  context.setTransform(state.pixelRatio, 0, 0, state.pixelRatio, 0, 0);
+  context.fillStyle = "#050308";
+  context.fillRect(0, 0, elements.canvas.clientWidth, elements.canvas.clientHeight);
+  context.save();
+  context.translate(fit.x, fit.y);
+  context.scale(fit.scale, fit.scale);
+
+  for (let row = 0; row < VIEW_ROWS; row += 1) {
+    for (let column = 0; column < VIEW_COLS; column += 1) {
+      const mapX = camera.x + column;
+      const mapY = camera.y + row;
+      const x = column * TILE;
+      const y = row * TILE;
+      const index = mapY * dungeon.w + mapX;
+
+      if (!dungeon.explored[index]) {
+        context.fillStyle = "#07050b";
+        context.fillRect(x, y, TILE, TILE);
         continue;
       }
-      if (!vis) {
-        ctx.fillStyle = "#11131a";
-        ctx.fillRect(px, py, TILE, TILE);
-        continue;
+
+      const tile = dungeon.grid[mapY][mapX];
+      if (tile === WALL) drawWall(x, y, mapX, mapY);
+      else drawFloor(x, y, mapX, mapY);
+
+      if (dungeon.visible[index]) {
+        if (tile === CHEST) drawChest(x, y);
+        else if (tile === RELIC) drawRelic(x, y);
+        else if (tile === STAIRS) drawGoal(x, y, false, dungeon.player.hasRelic);
+        else if (tile === EXIT) drawGoal(x, y, true, dungeon.player.hasRelic);
+      } else {
+        context.fillStyle = "rgb(5 3 8 / 72%)";
+        context.fillRect(x, y, TILE, TILE);
       }
-      // 畫圖塊
-      const t = d.grid[y][x];
-      let tile;
-      switch (t) {
-        case WALL: tile = TILES.wall; break;
-        case DOOR: tile = TILES.door; break;
-        case STAIRS: tile = TILES.stairs; break;
-        case EXIT: tile = TILES.exit; break;
-        case CHEST: tile = TILES.chest; break;
-        default: tile = TILES.floor;
-      }
-      const r = tileRect(tile);
-      ctx.drawImage(atlas, r.sx, r.sy, r.sw, r.sh, px, py, TILE, TILE);
     }
   }
 
-  // 敵人
-  for (const e of d.enemies) {
-    if (!e.alive) continue;
-    if (e.x < col0 || e.x > col1 || e.y < row0 || e.y > row1) continue;
-    const idx = e.y * d.w + e.x;
-    if (!d.visible[idx]) continue;
-    const tk = TILES.enemy[e.kind] || TILES.enemy.skeleton;
-    const r = tileRect(tk);
-    const px = (e.x - col0) * TILE;
-    const py = (e.y - row0) * TILE;
-    ctx.drawImage(atlas, r.sx, r.sy, r.sw, r.sh, px, py, TILE, TILE);
-    // HP 條
-    const ratio = e.hp / e.maxHp;
-    ctx.fillStyle = "#000";
-    ctx.fillRect(px + 1, py - 3, TILE - 2, 2);
-    ctx.fillStyle = ratio > 0.5 ? "#5cff5c" : ratio > 0.25 ? "#ffcd5c" : "#ff5c5c";
-    ctx.fillRect(px + 1, py - 3, Math.floor((TILE - 2) * ratio), 2);
+  for (const enemy of dungeon.enemies) {
+    if (!enemy.alive) continue;
+    const index = enemy.y * dungeon.w + enemy.x;
+    if (!dungeon.visible[index]) continue;
+    const x = (enemy.x - camera.x) * TILE;
+    const y = (enemy.y - camera.y) * TILE;
+    if (x < 0 || y < 0 || x >= VIEW_W || y >= VIEW_H) continue;
+
+    const sprite = SPRITES.enemies[enemy.kind] || SPRITES.enemies.skeleton;
+    if (!drawSprite(sprite, x, y)) drawFallbackEnemy(x, y, enemy.kind);
+    if (enemy.hp < enemy.maxHp) {
+      context.fillStyle = "#160d16";
+      context.fillRect(x + 4, y + 2, 24, 4);
+      context.fillStyle = "#ef5d60";
+      context.fillRect(x + 5, y + 3, Math.round(22 * enemy.hp / enemy.maxHp), 2);
+    }
   }
 
-  // 玩家
-  {
-    const px = (cx - col0) * TILE;
-    const py = (cy - row0) * TILE;
-    const tk = state.anim % 40 < 20 ? TILES.player : TILES.playerWalk;
-    const r = tileRect(tk);
-    ctx.drawImage(atlas, r.sx, r.sy, r.sw, r.sh, px, py, TILE, TILE);
+  const playerX = (dungeon.player.x - camera.x) * TILE;
+  const playerY = (dungeon.player.y - camera.y) * TILE;
+  context.fillStyle = dungeon.player.hasRelic ? "rgb(255 209 102 / 24%)" : "rgb(103 197 232 / 16%)";
+  context.fillRect(playerX + 2, playerY + 2, 28, 28);
+  if (!drawSprite(SPRITES.player, playerX, playerY)) {
+    context.fillStyle = "#67c5e8";
+    context.fillRect(playerX + 8, playerY + 5, 16, 23);
   }
 
-  // 視口框
-  ctx.strokeStyle = "rgba(255,255,255,0.18)";
-  ctx.lineWidth = 2;
-  ctx.strokeRect(0, 0, VIEW_W, VIEW_H);
+  if (state.impact && state.frame - state.impact.frame < 8) {
+    const x = (state.impact.x - camera.x) * TILE;
+    const y = (state.impact.y - camera.y) * TILE;
+    context.strokeStyle = "#fff3bd";
+    context.lineWidth = 3;
+    context.beginPath();
+    context.moveTo(x + 5, y + 26);
+    context.lineTo(x + 27, y + 5);
+    context.stroke();
+  }
 
-  ctx.restore();
+  context.strokeStyle = "#6d4c72";
+  context.lineWidth = 2;
+  context.strokeRect(1, 1, VIEW_W - 2, VIEW_H - 2);
+  context.restore();
 }
 
-/* HUD */
-function updateHud() {
-  if (!state.d) return;
-  const d = state.d;
-  el.floorN.textContent = String(d.level);
-  el.hpText.textContent = `${Math.max(0, d.player.hp)}/${d.player.maxHp}`;
-  const ratio = Math.max(0, d.player.hp) / d.player.maxHp;
-  el.hpBar.style.width = `${Math.floor(ratio * 100)}%`;
-  el.hpBar.style.background = ratio > 0.5 ? "#5cff5c" : ratio > 0.25 ? "#ffcd5c" : "#ff5c5c";
-  el.gold.textContent = String(d.player.gold);
-  el.potions.textContent = String(d.player.potions);
-  el.atk.textContent = String(d.player.atk);
-  el.log.innerHTML = "";
-  for (const item of d.log.slice(0, 6)) {
-    const li = document.createElement("li");
-    li.dataset.tone = item.kind;
-    li.textContent = item.text;
-    el.log.appendChild(li);
+function setStatus(message) {
+  elements.status.textContent = message;
+}
+
+function updateInterface() {
+  if (!state.dungeon) return;
+  const dungeon = state.dungeon;
+  const hpRatio = dungeon.player.hp / dungeon.player.maxHp;
+
+  elements.floor.textContent = String(dungeon.level);
+  elements.hp.textContent = `${dungeon.player.hp} / ${dungeon.player.maxHp}`;
+  elements.hpBar.style.width = `${Math.max(0, hpRatio * 100)}%`;
+  elements.hpBar.style.background = hpRatio > 0.5 ? "#7bd389" : hpRatio > 0.25 ? "#ffd166" : "#ef5d60";
+  elements.healthTrack.setAttribute("aria-valuemax", String(dungeon.player.maxHp));
+  elements.healthTrack.setAttribute("aria-valuenow", String(dungeon.player.hp));
+  elements.atk.textContent = String(dungeon.player.atk);
+  elements.gold.textContent = String(dungeon.player.gold);
+  elements.kills.textContent = String(dungeon.player.kills);
+  elements.potions.textContent = String(dungeon.player.potions);
+  elements.potion.disabled = dungeon.player.potions === 0 || dungeon.player.hp === dungeon.player.maxHp;
+
+  elements.quest.dataset.complete = String(dungeon.player.hasRelic);
+  elements.questIcon.textContent = dungeon.player.hasRelic ? "◆" : "◇";
+  elements.questTitle.textContent = dungeon.player.hasRelic
+    ? dungeon.level === dungeon.maxFloor ? "出口已開啟" : "樓梯已甦醒"
+    : "尋找符石";
+
+  elements.log.replaceChildren();
+  for (const event of dungeon.log.slice(0, 3)) {
+    const item = document.createElement("li");
+    item.dataset.tone = event.kind;
+    item.textContent = event.text;
+    elements.log.append(item);
   }
-  // 戰鬥 modal
-  if (d.state === "combat") {
-    const e = d.enemies.find(
-      (e) => e.alive && Math.abs(e.x - d.player.x) + Math.abs(e.y - d.player.y) === 1
-    );
-    if (e) {
-      el.combat.dataset.show = "true";
-      el.combatName.textContent = `${KIND_LABEL[e.kind] || e.kind}`;
-      el.combatHp.textContent = `${e.hp}/${e.maxHp}`;
-      el.combatBar.style.width = `${Math.floor((e.hp / e.maxHp) * 100)}%`;
+  if (!dungeon.log.length) {
+    const item = document.createElement("li");
+    item.textContent = "迷宮深處傳來低沉的回音……";
+    elements.log.append(item);
+  }
+
+  const ended = dungeon.state === "won" || dungeon.state === "dead";
+  elements.overlay.dataset.show = ended ? "true" : "";
+  elements.overlay.inert = !ended;
+  if (ended) {
+    const won = dungeon.state === "won";
+    elements.overlayMark.textContent = won ? "✦" : "☠";
+    elements.overlayTitle.textContent = won ? "符石征服者！" : "倒在迷宮裡";
+    elements.overlayText.textContent = won
+      ? `${dungeon.turns} 步穿越三層地城，擊破 ${dungeon.player.kills} 隻怪物，帶回 ${dungeon.player.gold} 枚古幣。`
+      : `抵達地下 ${dungeon.level}F，擊破 ${dungeon.player.kills} 隻怪物。下一次會走得更遠。`;
+    if (!state.overlayShown) {
+      state.overlayShown = true;
+      requestAnimationFrame(() => elements.restart.focus());
     }
   } else {
-    el.combat.dataset.show = "";
-  }
-  // 結束 overlay
-  if (d.state === "dead" || d.state === "won") {
-    el.overlay.dataset.show = "true";
-    if (d.state === "won") {
-      el.overlayTitle.textContent = "🎉 過關！";
-      el.overlayTitle.dataset.tone = "win";
-      el.overlayText.textContent = `完成 5 層地城，帶走 ${d.player.gold} 金幣。`;
-    } else {
-      el.overlayTitle.textContent = "💀 死亡";
-      el.overlayTitle.dataset.tone = "die";
-      el.overlayText.textContent = `倒在第 ${d.level} 樓，帶走 ${d.player.gold} 金幣。`;
-    }
-  } else {
-    el.overlay.dataset.show = "";
+    state.overlayShown = false;
   }
 }
 
-/* 流程 */
+async function wakeAudio() {
+  await audio.unlock();
+  if (!state.audioStarted && audio.enabled) {
+    state.audioStarted = true;
+    audio.playBgm();
+  }
+}
+
 function newGame(seed) {
-  state.seed = seed != null ? seed : Math.floor(Math.random() * 100000);
-  state.d = generateDungeon(state.seed, 1, 5);
-  recomputeVisibility(state.d);
-  state.d.log.unshift({ kind: "system", text: `歡迎來到地下城，第 ${state.d.level} 樓` });
-  audio.stopBgm();
-  if (audio.enabled) audio.playBgm();
-  setStatus("使用方向鍵或下方按鈕移動。");
+  state.seed = seed ?? Math.floor(Math.random() * 1_000_000);
+  state.dungeon = generateDungeon(state.seed);
+  state.dungeon.log.unshift({ kind: "system", text: "三層迷宮，一把劍。出發！" });
+  state.impact = null;
+  setStatus("在迷霧中找到發光符石，再前往出口。");
+  updateInterface();
 }
 
 function move(dx, dy) {
-  if (!state.d) return;
-  if (state.d.state !== "playing") return;
-  audio.unlock();
-  const before = state.d.player.hp;
-  const r = tryPlayerMove(state.d, dx, dy);
-  if (r.combat) {
-    audio.play("draw_sword");
-  } else if (r.moved) {
+  if (!state.dungeon || state.dungeon.state !== "playing") return;
+  wakeAudio();
+  const before = { x: state.dungeon.player.x + dx, y: state.dungeon.player.y + dy };
+  const result = tryPlayerMove(state.dungeon, dx, dy);
+
+  if (result.blocked) {
+    audio.play("click");
+    setStatus("石牆擋住了去路。");
+  } else if (result.locked) {
+    audio.play("click");
+    setStatus("出口沉睡著；符石就在這一層。");
+  } else if (result.hit) {
+    state.impact = { ...before, frame: state.frame };
+    audio.play(result.killed ? "pickup" : "sword");
+    setStatus(result.killed ? "漂亮的一擊！繼續前進。" : "怪物反擊了，再撞一次！");
+  } else if (result.relic) {
+    audio.play("spell");
+    setStatus(state.dungeon.level === state.dungeon.maxFloor ? "符石點亮最終出口！" : "符石點亮了通往下一層的樓梯！");
+  } else if (result.chest) {
+    audio.play("coin2");
+    setStatus("寶箱打開了！");
+  } else if (result.moved) {
     audio.play("step");
+    setStatus(state.dungeon.player.hasRelic ? "出口已開啟，循著金光前進。" : "留意迷霧裡的藍色光芒。");
   }
-  if (r.descend) {
+
+  if (result.descend) {
     audio.play("door");
-    state.d = descendLevel(state.d);
-    recomputeVisibility(state.d);
-    audio.play("door");
-    return;
+    state.dungeon = descendLevel(state.dungeon);
+    setStatus(`抵達地下 ${state.dungeon.level}F；本層也藏著一枚符石。`);
   }
-  if (r.won || (state.d.player.hp <= 0 && before > 0)) {
-    audio.stopBgm();
-    if (r.won) audio.play("spell");
-  }
+  if (result.death || result.won) audio.stopBgm();
+  updateInterface();
 }
 
-function setStatus(msg) {
-  el.status.textContent = msg;
+function usePotion() {
+  if (!state.dungeon) return;
+  wakeAudio();
+  const result = drinkPotion(state.dungeon);
+  if (result.used) {
+    audio.play("spell");
+    setStatus("暖流穿過全身，生命恢復了。");
+  }
+  if (result.death) audio.stopBgm();
+  updateInterface();
 }
 
-/* 輸入 */
+function bindDirection(button, dx, dy) {
+  let repeatTimer = 0;
+  let repeatInterval = 0;
+  const stop = () => {
+    window.clearTimeout(repeatTimer);
+    window.clearInterval(repeatInterval);
+  };
+  button.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    button.setPointerCapture?.(event.pointerId);
+    move(dx, dy);
+    repeatTimer = window.setTimeout(() => {
+      repeatInterval = window.setInterval(() => move(dx, dy), 125);
+    }, 320);
+  });
+  button.addEventListener("pointerup", stop);
+  button.addEventListener("pointercancel", stop);
+  button.addEventListener("lostpointercapture", stop);
+}
+
 function wireInput() {
-  window.addEventListener("keydown", (e) => {
-    audio.unlock();
-    if (state.d && state.d.state === "combat") {
-      // 戰鬥中：1=攻 2=藥 3=逃
-      if (e.key === "1" || e.key === "Enter") { doCombat("attack"); e.preventDefault(); }
-      if (e.key === "2") { doCombat("potion"); e.preventDefault(); }
-      if (e.key === "3" || e.key === "Escape") { doCombat("flee"); e.preventDefault(); }
+  window.addEventListener("keydown", (event) => {
+    if (event.repeat) return;
+    const key = event.key.toLowerCase();
+    const moves = {
+      arrowleft: [-1, 0],
+      a: [-1, 0],
+      arrowright: [1, 0],
+      d: [1, 0],
+      arrowup: [0, -1],
+      w: [0, -1],
+      arrowdown: [0, 1],
+      s: [0, 1],
+    };
+    if (moves[key]) {
+      event.preventDefault();
+      move(...moves[key]);
+    } else if (key === "h" || key === "p") {
+      event.preventDefault();
+      usePotion();
+    }
+  });
+
+  bindDirection(elements.directions.up, 0, -1);
+  bindDirection(elements.directions.left, -1, 0);
+  bindDirection(elements.directions.down, 0, 1);
+  bindDirection(elements.directions.right, 1, 0);
+
+  let pointerStart = null;
+  elements.canvas.addEventListener("pointerdown", (event) => {
+    pointerStart = { x: event.clientX, y: event.clientY };
+    elements.canvas.setPointerCapture?.(event.pointerId);
+  });
+  elements.canvas.addEventListener("pointerup", (event) => {
+    if (!pointerStart) return;
+    const dx = event.clientX - pointerStart.x;
+    const dy = event.clientY - pointerStart.y;
+    pointerStart = null;
+    if (Math.max(Math.abs(dx), Math.abs(dy)) > 18) {
+      if (Math.abs(dx) > Math.abs(dy)) move(Math.sign(dx), 0);
+      else move(0, Math.sign(dy));
       return;
     }
-    if (e.repeat) return;
-    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") move(-1, 0);
-    else if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") move(1, 0);
-    else if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") move(0, -1);
-    else if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") move(0, 1);
-    else if (e.key === "Enter" || e.key === " ") { e.preventDefault(); /* no-op */ }
+    const rect = elements.canvas.getBoundingClientRect();
+    const fromCenterX = event.clientX - (rect.left + rect.width / 2);
+    const fromCenterY = event.clientY - (rect.top + rect.height / 2);
+    if (Math.abs(fromCenterX) > Math.abs(fromCenterY)) move(Math.sign(fromCenterX), 0);
+    else move(0, Math.sign(fromCenterY));
+  });
+  elements.canvas.addEventListener("pointercancel", () => {
+    pointerStart = null;
   });
 
-  // 觸控鍵
-  const mk = (elx, fn) => {
-    let pressed = false;
-    const start = (e) => { e.preventDefault(); audio.unlock(); pressed = true; fn(); };
-    const end = (e) => { e.preventDefault(); pressed = false; };
-    elx.addEventListener("touchstart", start, { passive: false });
-    elx.addEventListener("touchend", end, { passive: false });
-    elx.addEventListener("touchcancel", end, { passive: false });
-    elx.addEventListener("mousedown", start);
-    elx.addEventListener("mouseup", end);
-    elx.addEventListener("mouseleave", end);
-  };
-  mk(el.touchLeft, () => move(-1, 0));
-  mk(el.touchRight, () => move(1, 0));
-  mk(el.touchUp, () => move(0, -1));
-  mk(el.touchDown, () => move(0, 1));
-
-  // 畫面 swipe
-  let touchStart = null;
-  el.canvas.addEventListener("touchstart", (e) => {
-    if (e.touches.length !== 1) return;
-    audio.unlock();
-    touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
-  }, { passive: true });
-  el.canvas.addEventListener("touchend", (e) => {
-    if (!touchStart) return;
-    const t = e.changedTouches[0];
-    const dx = t.clientX - touchStart.x;
-    const dy = t.clientY - touchStart.y;
-    const adx = Math.abs(dx);
-    const ady = Math.abs(dy);
-    if (Math.max(adx, ady) > 24) {
-      if (adx > ady) move(dx > 0 ? 1 : -1, 0);
-      else move(0, dy > 0 ? 1 : -1);
-    } else if (Date.now() - touchStart.t < 250) {
-      move(0, -1); // tap = up
-    }
-    touchStart = null;
-  }, { passive: true });
-
-  // 按鈕
-  el.btnNewGame.addEventListener("click", () => newGame());
-  el.btnRestart.addEventListener("click", () => newGame(state.seed));
-  el.btnMute.addEventListener("click", () => {
-    const on = !audio.enabled;
-    audio.setEnabled(on);
-    el.btnMute.setAttribute("aria-pressed", String(on));
-    el.btnMute.textContent = on ? "音效開" : "音效關";
-    if (on) audio.playBgm();
-    else audio.stopBgm();
+  elements.potion.addEventListener("click", usePotion);
+  elements.restart.addEventListener("click", () => {
+    wakeAudio();
+    newGame();
   });
-
-  el.btnAttack.addEventListener("click", () => doCombat("attack"));
-  el.btnPotion.addEventListener("click", () => doCombat("potion"));
-  el.btnFlee.addEventListener("click", () => doCombat("flee"));
-
+  elements.newGame.addEventListener("click", () => {
+    wakeAudio();
+    newGame();
+  });
+  elements.mute.addEventListener("click", () => {
+    const muted = audio.enabled;
+    audio.setEnabled(!muted);
+    elements.mute.setAttribute("aria-pressed", String(muted));
+    elements.mute.setAttribute("aria-label", muted ? "開啟音效" : "關閉音效");
+    elements.mute.textContent = muted ? "×" : "♪";
+    if (!muted) wakeAudio();
+  });
   window.addEventListener("resize", resizeCanvas);
 }
 
-function doCombat(action) {
-  if (!state.d || state.d.state !== "combat") return;
-  audio.unlock();
-  const r = combatAction(state.d, action);
-  // 音效
-  if (action === "attack") audio.play("sword");
-  else if (action === "potion") audio.play("coin2");
-  else audio.play("step");
-  if (r.death) audio.play("hurt");
-  if (r.victory) audio.play("pickup");
-  // 戰鬥結束 → 敵人回合（若存活）
-  if (r.done) {
-    if (!r.death && !r.victory && state.d.state === "playing") {
-      // 已逃脫或回合未結束時，敵不會再動因為 combatAction 已經處理
-    }
-  }
-}
-
-/* 主迴圈 */
 function tick() {
-  state.anim++;
-  draw();
-  updateHud();
+  state.frame += 1;
+  drawDungeon();
   requestAnimationFrame(tick);
 }
 
-/* 啟動 */
 async function init() {
-  try {
-    resizeCanvas();
-    wireInput();
-    await audio.unlock();
-    await audio.preloadAll();
-    // 預先下載圖塊（atlas）
-    if (!atlas.complete) {
-      await new Promise((res) => { atlas.onload = res; atlas.onerror = res; });
-    }
-    newGame();
-    requestAnimationFrame(tick);
-  } catch (e) {
-    console.error("[pg-microdungeon] init failed", e);
-    setStatus("初始化失敗：" + (e?.message || e));
-  }
+  resizeCanvas();
+  wireInput();
+  newGame();
+  audio.preloadAll();
+  requestAnimationFrame(tick);
 }
 
-init();
+init().catch((error) => {
+  console.error("[pg-microdungeon] init failed", error);
+  setStatus("迷宮暫時無法開啟，請重新整理。");
+});
 
-// devtools helper
 if (typeof window !== "undefined") {
-  window.__dung = { state, audio, get dungeon() { return state.d; } };
+  window.__dung = {
+    state,
+    get dungeon() {
+      return state.dungeon;
+    },
+  };
 }
