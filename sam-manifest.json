@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "rev": "e03265a",
+  "files": [
+    "app.js",
+    "assets/sfx/bgm.ogg",
+    "assets/sfx/click.ogg",
+    "assets/sfx/coin2.ogg",
+    "assets/sfx/door.ogg",
+    "assets/sfx/draw_sword.ogg",
+    "assets/sfx/pickup.ogg",
+    "assets/sfx/slime1.ogg",
+    "assets/sfx/slime2.ogg",
+    "assets/sfx/spell.ogg",
+    "assets/sfx/step.ogg",
+    "assets/sfx/sword.ogg",
+    "assets/tiles/atlas.png",
+    "audio.js",
+    "functions.js",
+    "game.js",
+    "index.html",
+    "styles.css"
+  ]
+}
